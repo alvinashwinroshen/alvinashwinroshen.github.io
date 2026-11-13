@@ -249,34 +249,60 @@ var prefs=load("tr_prefs",{sound:false,notify:false,awake:false,every:120});
 var chip="All",query="",syncing=false,lastSync=0,nextAt=0,timer=null;
 
 /* ---------- fetching ---------- */
-var PROXIES=[
- function(u){return "https://api.allorigins.win/raw?url="+encodeURIComponent(u)},
- function(u){return "https://corsproxy.io/?url="+encodeURIComponent(u)}
+var XML_PROXIES=[
+ function(u){return {url:"https://api.codetabs.com/v1/proxy?quest="+encodeURIComponent(u),type:"raw"}},
+ function(u){return {url:"https://api.allorigins.win/get?url="+encodeURIComponent(u),type:"ao_json"}},
+ function(u){return {url:"https://api.allorigins.win/raw?url="+encodeURIComponent(u),type:"raw"}},
+ function(u){return {url:"https://corsproxy.io/?url="+encodeURIComponent(u),type:"raw"}}
 ];
 function timeoutFetch(url,ms){
   var c=new AbortController();var t=setTimeout(function(){c.abort()},ms);
-  return fetch(url,{signal:c.signal,cache:"no-store"}).then(function(r){clearTimeout(t);if(!r.ok)throw new Error("HTTP "+r.status);return r.text()},function(e){clearTimeout(t);throw e});
-}
-async function fetchText(u){
-  var err;
-  for(var i=0;i<PROXIES.length;i++){
-    try{var t=await timeoutFetch(PROXIES[i](u),14000);if(t&&t.indexOf("<")>-1)return t;}catch(e){err=e}
-  }
-  throw err||new Error("failed");
+  return fetch(url,{signal:c.signal}).then(function(r){
+    clearTimeout(t);
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.text();
+  },function(e){clearTimeout(t);throw e});
 }
 function parseFeed(text){
-  var doc=new DOMParser().parseFromString(text,"text/xml");
+  var clean=text.replace(/^[\s\S]*?(?=<\?xml|<rss|<feed)/i,"").trim();
+  var doc=new DOMParser().parseFromString(clean||text,"text/xml");
   if(doc.querySelector("parsererror"))throw new Error("bad XML");
   var out=[];
   doc.querySelectorAll("item,entry").forEach(function(it){
     var g=function(n){var e=it.getElementsByTagName(n)[0];return e?e.textContent.trim():""};
-    var l=it.getElementsByTagName("link")[0];
-    var link=l?(l.getAttribute("href")||l.textContent.trim()):"";
+    var links=Array.from(it.getElementsByTagName("link"));
+    var alt=links.find(function(l){return !l.getAttribute("rel")||l.getAttribute("rel")==="alternate"})||links[0];
+    var link=alt?(alt.getAttribute("href")||alt.textContent.trim()):"";
     var title=g("title");
     var d=Date.parse(g("pubDate")||g("published")||g("updated")||g("dc:date"));
     if(title&&link)out.push({title:title,link:link,time:isNaN(d)?Date.now():d});
   });
   return out;
+}
+async function fetchFeedItems(u){
+  var err;
+  for(var i=0;i<XML_PROXIES.length;i++){
+    try{
+      var p=XML_PROXIES[i](u);
+      var raw=await timeoutFetch(p.url,12000);
+      var xml=p.type==="ao_json"?JSON.parse(raw).contents:raw;
+      if(xml&&xml.indexOf("<")>-1){
+        var parsed=parseFeed(xml);
+        if(parsed.length)return parsed;
+      }
+    }catch(e){err=e}
+  }
+  try{
+    var rj=await timeoutFetch("https://api.rss2json.com/v1/api.json?rss_url="+encodeURIComponent(u),10000);
+    var data=JSON.parse(rj);
+    if(data&&data.status==="ok"&&Array.isArray(data.items)){
+      return data.items.map(function(it){
+        var d=Date.parse(it.pubDate?(it.pubDate.replace(" ","T")+"Z"):0);
+        return {title:it.title,link:it.link,time:isNaN(d)?Date.now():d};
+      });
+    }
+  }catch(e){err=e}
+  throw err||new Error("failed");
 }
 
 /* ---------- scoring ---------- */
@@ -305,7 +331,7 @@ function rescore(){
 /* ---------- sync ---------- */
 async function syncFeed(f){
   try{
-    var arr=parseFeed(await fetchText(f.url));
+    var arr=await fetchFeedItems(f.url);
     f.ok=true;f.count=arr.length;
     var cutoff=Date.now()-3*864e5;
     arr.slice(0,30).forEach(function(it){
@@ -322,8 +348,14 @@ async function syncFeed(f){
 async function syncAll(){
   if(syncing)return;syncing=true;setStatus("Syncing…");
   var before=new Set(newIds);
-  await Promise.all(feeds.map(syncFeed));
-  rescore();
+  var batchSize=3;
+  for(var i=0;i<feeds.length;i+=batchSize){
+    setStatus("Syncing ("+Math.min(feeds.length,i+batchSize)+"/"+feeds.length+")…");
+    await Promise.all(feeds.slice(i,i+batchSize).map(syncFeed));
+    rescore();
+    if(window.__radar)window.__radar.onFresh([],[]);
+    render();
+  }
   if(items.size)firstRun=false;
   save("tr_seen",Array.from(seen).slice(-3000));
   lastSync=Date.now();syncing=false;schedule();
